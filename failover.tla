@@ -1,58 +1,71 @@
 ------------------------------- MODULE failover -------------------------------
 EXTENDS TLC, Integers
-CONSTANT NULL, INSTANCES, GOD, DEVIL, NODES_MAPPING, NODES_OFFSET
+CONSTANT NULL, NODES, GOD, DEVIL, NODES_MAPPING, NODES_OFFSET
 
 (* --algorithm failover
 
-(* Алгоритм **stateful** фейловера подразумевает, что есть внешнее
-хранилище, которое хранит единственное состояние кластера и всем
-остальным предлагается использовать именно его при выборе роли.
-В этом подходе есть узкие места, которые СТОИТ постараться разделить
-+------------------------------------------------------------------+
-1) В хранилище может писать один король (lock)?
-+------------------------------------------------------------------+
-2) Что может пойти не так при множественном чтении из хранилища?
-+------------------------------------------------------------------+
-3) Может ли развалить кластер 1 король захвативший lock?
-+------------------------------------------------------------------+
-...
-Здесь буду описывать третий сценарий. *)    
+(* Полный алгоритм **stateful** фейловера состоит из трех элементов
+1. Узлы в репликасете, которые могут иметь 2 роли - ведущий узел(leader[id] = TRUE) и ведомый (leader[id] = FALSE)
+2. Координатор который сообщает о состоянии узлов, его поведение моделируется при помощи SwitchProc
+3. Внешнее хранилище хранящее единственное представление о состоянии кластера, в нашем случае переменная stateboard_leader
+
+fencing - алгоритм самоограждения узла при потере связи с ? координатором.
+Назначеный узел перед тем как *)
+
     variables
-        (* здесь хранится реальное текущее состояние для каждого инстанса *)
-        health = [h \in INSTANCES |-> FALSE],
-        (* здесь хранится реальная текущая роль для каждого инстанса *)
-        leader = [l \in INSTANCES |-> FALSE],
+        (* текущее состояние для каждого узла *)
+        health = [n \in NODES |-> FALSE],
+        (* информация о доступности узла, нужно для моделирования
+        ситуаций когда происходит потеря связи с узлом при его фактической доступности*)
+        availability = [n \in NODES |-> FALSE],
+        (* реальная текущая роль каждого инстанса *)
+        leader = [n \in NODES |-> FALSE],
         (* выбранный лидер *)
-        stateboard_leader = 1
+        stateboard_leader = 1,
+        last_accepting_leader = 1
     define
-        (* Если существуют как минимум два живых инстанса
+        (* Если существуют как минимум два живых узла
         из одного репликасета и они оба являются людерами одновременно,
         то условие инварианта нарушено *)
-        AtMostOneMaster == <>[](\A m1, m2 \in INSTANCES: (m1 /= m2) => ~(leader[m1] = TRUE /\ leader[m2] = TRUE))
+        AtMostOneMaster == [](\A n1, n2 \in NODES: (n1 /= n2) => ~(leader[n1] = TRUE /\ leader[n2] = TRUE))
         (* Мы ожидаем, что в конечном счете лидером станет первый узел
         такое свойство исходит из перехода end_switch_beat *)
         EventuallyRecover == <>[](leader[1] = TRUE)
+        
     end define;
+
+    macro NodeUp(node_id)
+    (* Переводит узел в рабочее состояние и делает его доступным *)
+    begin
+        health[node_id] := TRUE;
+        availability[node_id] := TRUE;
+    end macro;
+
+    macro NodeDown(node_id)
+    (* Переводит узел в выключенное состояние и делает его недоступным *)
+    begin
+        health[node_id] := FALSE;
+        availability[node_id] := FALSE;
+    end macro;
 
     (* Процесс отражающий смену лидера внутри репликасета,
     текущее состояние хранится в kingdom masters *)
     fair process SwitchProc = GOD
     variables
-        switch_count = 0;
+        switch_count = 1;
     begin
         switch_beat:
             while switch_count > 0 do
-                (* TLC будет моделировать каждый возможный переход *)
-                with new_leader \in INSTANCES do
+                with new_leader \in NODES do
                     stateboard_leader := new_leader;
                 end with;
                 switch_count := (switch_count - 1)
             end while;
         end_switch_beat:
-            (* Возвращаем исходного лидера репликасета
-            для того, что бы "в конце концов" лидером определенно
-            оказался инстанс с номером 1.
-            Без этого невозможно поставить условие конечного восстановления*)
+            (* Возвращаем исходного лидера репликасета для того,
+            что бы "в конце концов" лидером определенно оказался узел №1.
+            Без этого невозможно поставить условие конечного восстановления,
+            так как в каждом поведении последним был бы неопределенный узел *)
             stateboard_leader := 1;
     end process;
 
@@ -60,152 +73,208 @@ CONSTANT NULL, INSTANCES, GOD, DEVIL, NODES_MAPPING, NODES_OFFSET
     и восстановление инстансов в репликасете *)
     fair process LiveProc \in NODES_MAPPING
     variables
-        target_node = self - NODES_OFFSET;
-        beat_count = 0;
+        target_node = (self - NODES_OFFSET);
+        beat_count = 1;
     begin
         live_beat:
             while beat_count > 0 do
                 either
-                    (* узел жив (восстановлен если был мертв) *)
-                    health[target_node] := TRUE;
+                (* полностью восстанавливаем узел *)
+                    NodeUp(target_node);
                 or
-                    (* узел мертв (выключен если был жив) *)
-                    health[target_node] := FALSE;
-                    leader[target_node] := FALSE;
+                (* полностью отключаем узел *)
+                    NodeDown(target_node);
+                or
+                    if health[target_node] = TRUE then
+                    (* переключаем доступность узла *)
+                        availability[target_node] := ~availability[target_node]
+                    end if;
                 end either;
                 beat_count := (beat_count - 1);
             end while;
 
         end_live_beat:
-            (* Восстанавливаем все узлы кластера *)
+        (* Восстанавливаем все узлы кластера *)
             health[target_node] := TRUE;
 
     end process;
 
-    (* Основные процессы для каждого инстанса
-    отвечающие за старт, первичную инициализацию и
-    обновление собственного статуса согласно информации
-    из хранилища (stateboard_leader) *)
-    fair process FailoverProc \in INSTANCES
+    (* Основной процесс для каждого узла
+    отвечающий за обновление собственного статуса
+    согласно информации из внешнего хранилища *)
+    fair process FailoverProc \in NODES
     variables
         appointment = stateboard_leader;
     begin
-        die: await (health[self] = TRUE);
         get_appointment:
         (* гарантируем что ничего не произойдет, если узел отключен *)
             if health[self] = FALSE then
                 goto die;
-            else
-                appointment := (stateboard_leader)
+            else    
+                if availability[self] = FALSE then
+                    leader[self] := FALSE;
+                    goto reachless;
+                end if;
             end if;
-        (* применение назначения *)
         apply:
+        (* применение назначения *)
             if health[self] = FALSE then
                 goto die;
             else
-                leader[self] := (appointment = self);
+                if appointment = self then
+                    if availability[last_accepting_leader] = TRUE then
+                        await (leader[last_accepting_leader] = FALSE);
+                    end if;
+                    leader[self] := (appointment = self);
+                    last_accepting_leader := self;
+                end if;
                 goto get_appointment;
             end if;
+
+        die:
+            await (health[self] = TRUE);
+            goto get_appointment;
+
+        reachless:
+            await (availability[self] = TRUE);
+            goto get_appointment;
+        
     end process;
 
 end algorithm;*)
-
-\* BEGIN TRANSLATION - the hash of the PCal code: PCal-a696d27e8116bb71dd12f4feb84a9a49
-VARIABLES health, leader, stateboard_leader, pc
+\* BEGIN TRANSLATION - the hash of the PCal code: PCal-bba36ce5d1dde565e84514fa5a99fe98
+VARIABLES health, availability, leader, stateboard_leader, 
+          last_accepting_leader, pc
 
 (* define statement *)
-AtMostOneMaster == <>[](\A m1, m2 \in INSTANCES: (m1 /= m2) => ~(leader[m1] = TRUE /\ leader[m2] = TRUE))
+AtMostOneMaster == [](\A n1, n2 \in NODES: (n1 /= n2) => ~(leader[n1] = TRUE /\ leader[n2] = TRUE))
 
 
 EventuallyRecover == <>[](leader[1] = TRUE)
 
 VARIABLES switch_count, target_node, beat_count, appointment
 
-vars == << health, leader, stateboard_leader, pc, switch_count, target_node, 
-           beat_count, appointment >>
+vars == << health, availability, leader, stateboard_leader, 
+           last_accepting_leader, pc, switch_count, target_node, beat_count, 
+           appointment >>
 
-ProcSet == {GOD} \cup (NODES_MAPPING) \cup (INSTANCES)
+ProcSet == {GOD} \cup (NODES_MAPPING) \cup (NODES)
 
 Init == (* Global variables *)
-        /\ health = [h \in INSTANCES |-> FALSE]
-        /\ leader = [l \in INSTANCES |-> FALSE]
+        /\ health = [n \in NODES |-> FALSE]
+        /\ availability = [n \in NODES |-> FALSE]
+        /\ leader = [n \in NODES |-> FALSE]
         /\ stateboard_leader = 1
+        /\ last_accepting_leader = 1
         (* Process SwitchProc *)
-        /\ switch_count = 0
+        /\ switch_count = 1
         (* Process LiveProc *)
-        /\ target_node = [self \in NODES_MAPPING |-> self - NODES_OFFSET]
-        /\ beat_count = [self \in NODES_MAPPING |-> 0]
+        /\ target_node = [self \in NODES_MAPPING |-> (self - NODES_OFFSET)]
+        /\ beat_count = [self \in NODES_MAPPING |-> 1]
         (* Process FailoverProc *)
-        /\ appointment = [self \in INSTANCES |-> stateboard_leader]
+        /\ appointment = [self \in NODES |-> stateboard_leader]
         /\ pc = [self \in ProcSet |-> CASE self = GOD -> "switch_beat"
                                         [] self \in NODES_MAPPING -> "live_beat"
-                                        [] self \in INSTANCES -> "die"]
+                                        [] self \in NODES -> "get_appointment"]
 
 switch_beat == /\ pc[GOD] = "switch_beat"
                /\ IF switch_count > 0
-                     THEN /\ \E new_leader \in INSTANCES:
+                     THEN /\ \E new_leader \in NODES:
                                stateboard_leader' = new_leader
                           /\ switch_count' = (switch_count - 1)
                           /\ pc' = [pc EXCEPT ![GOD] = "switch_beat"]
                      ELSE /\ pc' = [pc EXCEPT ![GOD] = "end_switch_beat"]
                           /\ UNCHANGED << stateboard_leader, switch_count >>
-               /\ UNCHANGED << health, leader, target_node, beat_count, 
+               /\ UNCHANGED << health, availability, leader, 
+                               last_accepting_leader, target_node, beat_count, 
                                appointment >>
 
 end_switch_beat == /\ pc[GOD] = "end_switch_beat"
                    /\ stateboard_leader' = 1
                    /\ pc' = [pc EXCEPT ![GOD] = "Done"]
-                   /\ UNCHANGED << health, leader, switch_count, target_node, 
-                                   beat_count, appointment >>
+                   /\ UNCHANGED << health, availability, leader, 
+                                   last_accepting_leader, switch_count, 
+                                   target_node, beat_count, appointment >>
 
 SwitchProc == switch_beat \/ end_switch_beat
 
 live_beat(self) == /\ pc[self] = "live_beat"
                    /\ IF beat_count[self] > 0
                          THEN /\ \/ /\ health' = [health EXCEPT ![target_node[self]] = TRUE]
-                                    /\ UNCHANGED leader
+                                    /\ availability' = [availability EXCEPT ![target_node[self]] = TRUE]
                                  \/ /\ health' = [health EXCEPT ![target_node[self]] = FALSE]
-                                    /\ leader' = [leader EXCEPT ![target_node[self]] = FALSE]
+                                    /\ availability' = [availability EXCEPT ![target_node[self]] = FALSE]
+                                 \/ /\ IF health[target_node[self]] = TRUE
+                                          THEN /\ availability' = [availability EXCEPT ![target_node[self]] = ~availability[target_node[self]]]
+                                          ELSE /\ TRUE
+                                               /\ UNCHANGED availability
+                                    /\ UNCHANGED health
                               /\ beat_count' = [beat_count EXCEPT ![self] = (beat_count[self] - 1)]
                               /\ pc' = [pc EXCEPT ![self] = "live_beat"]
                          ELSE /\ pc' = [pc EXCEPT ![self] = "end_live_beat"]
-                              /\ UNCHANGED << health, leader, beat_count >>
-                   /\ UNCHANGED << stateboard_leader, switch_count, 
+                              /\ UNCHANGED << health, availability, beat_count >>
+                   /\ UNCHANGED << leader, stateboard_leader, 
+                                   last_accepting_leader, switch_count, 
                                    target_node, appointment >>
 
 end_live_beat(self) == /\ pc[self] = "end_live_beat"
                        /\ health' = [health EXCEPT ![target_node[self]] = TRUE]
                        /\ pc' = [pc EXCEPT ![self] = "Done"]
-                       /\ UNCHANGED << leader, stateboard_leader, switch_count, 
+                       /\ UNCHANGED << availability, leader, stateboard_leader, 
+                                       last_accepting_leader, switch_count, 
                                        target_node, beat_count, appointment >>
 
 LiveProc(self) == live_beat(self) \/ end_live_beat(self)
 
-die(self) == /\ pc[self] = "die"
-             /\ (health[self] = TRUE)
-             /\ pc' = [pc EXCEPT ![self] = "get_appointment"]
-             /\ UNCHANGED << health, leader, stateboard_leader, switch_count, 
-                             target_node, beat_count, appointment >>
-
 get_appointment(self) == /\ pc[self] = "get_appointment"
                          /\ IF health[self] = FALSE
                                THEN /\ pc' = [pc EXCEPT ![self] = "die"]
-                                    /\ UNCHANGED appointment
-                               ELSE /\ appointment' = [appointment EXCEPT ![self] = (stateboard_leader)]
-                                    /\ pc' = [pc EXCEPT ![self] = "apply"]
-                         /\ UNCHANGED << health, leader, stateboard_leader, 
-                                         switch_count, target_node, beat_count >>
+                                    /\ UNCHANGED leader
+                               ELSE /\ IF availability[self] = FALSE
+                                          THEN /\ leader' = [leader EXCEPT ![self] = FALSE]
+                                               /\ pc' = [pc EXCEPT ![self] = "reachless"]
+                                          ELSE /\ pc' = [pc EXCEPT ![self] = "apply"]
+                                               /\ UNCHANGED leader
+                         /\ UNCHANGED << health, availability, 
+                                         stateboard_leader, 
+                                         last_accepting_leader, switch_count, 
+                                         target_node, beat_count, appointment >>
 
 apply(self) == /\ pc[self] = "apply"
                /\ IF health[self] = FALSE
                      THEN /\ pc' = [pc EXCEPT ![self] = "die"]
-                          /\ UNCHANGED leader
-                     ELSE /\ leader' = [leader EXCEPT ![self] = (appointment[self] = self)]
+                          /\ UNCHANGED << leader, last_accepting_leader >>
+                     ELSE /\ IF appointment[self] = self
+                                THEN /\ IF availability[last_accepting_leader] = TRUE
+                                           THEN /\ (leader[last_accepting_leader] = FALSE)
+                                           ELSE /\ TRUE
+                                     /\ leader' = [leader EXCEPT ![self] = (appointment[self] = self)]
+                                     /\ last_accepting_leader' = self
+                                ELSE /\ TRUE
+                                     /\ UNCHANGED << leader, 
+                                                     last_accepting_leader >>
                           /\ pc' = [pc EXCEPT ![self] = "get_appointment"]
-               /\ UNCHANGED << health, stateboard_leader, switch_count, 
-                               target_node, beat_count, appointment >>
+               /\ UNCHANGED << health, availability, stateboard_leader, 
+                               switch_count, target_node, beat_count, 
+                               appointment >>
 
-FailoverProc(self) == die(self) \/ get_appointment(self) \/ apply(self)
+die(self) == /\ pc[self] = "die"
+             /\ (health[self] = TRUE)
+             /\ pc' = [pc EXCEPT ![self] = "get_appointment"]
+             /\ UNCHANGED << health, availability, leader, stateboard_leader, 
+                             last_accepting_leader, switch_count, target_node, 
+                             beat_count, appointment >>
+
+reachless(self) == /\ pc[self] = "reachless"
+                   /\ (availability[self] = TRUE)
+                   /\ pc' = [pc EXCEPT ![self] = "get_appointment"]
+                   /\ UNCHANGED << health, availability, leader, 
+                                   stateboard_leader, last_accepting_leader, 
+                                   switch_count, target_node, beat_count, 
+                                   appointment >>
+
+FailoverProc(self) == get_appointment(self) \/ apply(self) \/ die(self)
+                         \/ reachless(self)
 
 (* Allow infinite stuttering to prevent deadlock on termination. *)
 Terminating == /\ \A self \in ProcSet: pc[self] = "Done"
@@ -213,15 +282,17 @@ Terminating == /\ \A self \in ProcSet: pc[self] = "Done"
 
 Next == SwitchProc
            \/ (\E self \in NODES_MAPPING: LiveProc(self))
-           \/ (\E self \in INSTANCES: FailoverProc(self))
+           \/ (\E self \in NODES: FailoverProc(self))
            \/ Terminating
 
 Spec == /\ Init /\ [][Next]_vars
         /\ WF_vars(SwitchProc)
         /\ \A self \in NODES_MAPPING : WF_vars(LiveProc(self))
-        /\ \A self \in INSTANCES : WF_vars(FailoverProc(self))
+        /\ \A self \in NODES : WF_vars(FailoverProc(self))
 
 Termination == <>(\A self \in ProcSet: pc[self] = "Done")
 
-\* END TRANSLATION - the hash of the generated TLA code (remove to silence divergence warnings): TLA-ce4aa8e14391c60b43057dbe0940ea00
+\* END TRANSLATION - the hash of the generated TLA code (remove to silence divergence warnings): TLA-613fca6346c535169bbe7b6c5c561107
+
+
 ===================================================
